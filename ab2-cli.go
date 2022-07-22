@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/urfave/cli/v2"
@@ -95,7 +96,7 @@ func triggerM2c(cCtx *cli.Context) error {
 func upload2s3(cCtx *cli.Context) error {
 	switch protocol {
 	case "local":
-		return uploadFromLocal(path, path)
+		return uploadFromLocal(path, filepath.Base(path))
 	case "ipfs":
 		localPath, err := downloadFromIpfs(path)
 		if err != nil {
