@@ -1,44 +1,202 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/spf13/viper"
+	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
+	"net/http/httputil"
 	"os"
+	"time"
 
 	"github.com/urfave/cli/v2"
 )
 
-func main() {
-	var filetype string
-	var protocol string
-	var path string
+var filetype string
+var protocol string
+var path string
+var apiGWUrl string
+var ingestBucket string
+var ipfsGW string
 
-	processAction := func(cCtx *cli.Context) error {
-		switch protocol {
-		case "local":
-			content, err := ioutil.ReadFile(path)
-			if err != nil {
-				log.Fatal(err)
-				return err
-			}
-			fmt.Println(string(content))
-		default:
-			return fmt.Errorf("Not implemented")
-		}
-		return nil
+func triggerM2c(cCtx *cli.Context) error {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+
+	if err != nil {
+		log.Fatal(err)
+		os.Exit(1)
 	}
 
-	processCommand := cli.Command{
-		Name:    "process",
-		Aliases: []string{"p"},
-		Usage:   "process a file",
+	credentials, err := cfg.Credentials.Retrieve(context.TODO())
+
+	if err != nil {
+		log.Fatal(err)
+		os.Exit(1)
+	}
+
+	values := map[string]string{"bucket": ingestBucket, "key": path}
+	jsonValue, _ := json.Marshal(values)
+	fmt.Printf("Json string %v\n", values)
+
+	sha_sum := sha256.Sum256(jsonValue)
+	hash := fmt.Sprintf("%x", sha_sum)
+	fmt.Printf("Hash %s\n", hash)
+
+	// The signer requires a payload hash. This hash is for an empty payload.
+	//hash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	req, _ := http.NewRequest(http.MethodPost, apiGWUrl, bytes.NewBuffer(jsonValue))
+	req.Header.Add("Content-Type", "application/json")
+
+	signer := v4.NewSigner()
+	err = signer.SignHTTP(context.TODO(), credentials, req, hash, "execute-api", cfg.Region, time.Now())
+
+	if err != nil {
+		log.Fatal(err)
+		os.Exit(1)
+	}
+
+	dump, _ := httputil.DumpRequestOut(req, true)
+	fmt.Println(string(dump))
+
+	res, err := http.DefaultClient.Do(req)
+
+	if err != nil {
+		fmt.Printf("failed to call remote service: (%v)\n", err)
+		return cli.Exit(err, 1)
+	}
+
+	defer res.Body.Close()
+	fmt.Printf("%v", res)
+
+	if res.StatusCode != 200 {
+		return cli.Exit(err, 1)
+	} else {
+		bodyBytes, err := io.ReadAll(res.Body)
+		if err != nil {
+			log.Fatal(err)
+		}
+		bodyString := string(bodyBytes)
+		fmt.Println(bodyString)
+	}
+
+	return nil
+}
+
+func upload2s3(cCtx *cli.Context) error {
+	switch protocol {
+	case "local":
+		return uploadFromLocal(path, path)
+	case "ipfs":
+		localPath, err := downloadFromIpfs(path)
+		if err != nil {
+			return err
+		}
+		return uploadFromLocal(localPath, path+"."+filetype)
+	default:
+		return fmt.Errorf("Not implemented")
+	}
+
+	return nil
+}
+
+func downloadFromIpfs(path string) (string, error) {
+	req, _ := http.NewRequest(http.MethodPost, ipfsGW, nil)
+	q := req.URL.Query()
+	q.Add("arg", path)
+	req.URL.RawQuery = q.Encode()
+
+	dump, _ := httputil.DumpRequestOut(req, false)
+	fmt.Println(string(dump))
+
+	resp, err := http.DefaultClient.Do(req)
+	fmt.Printf("Response: %v\n", resp)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("error fetching from IPFS with status code %d", resp.StatusCode)
+	}
+
+	filename := path + "." + filetype
+	fmt.Printf("Filename: %s", filename)
+
+	out, err := ioutil.TempFile("", filename)
+	filename = out.Name()
+
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return filename, nil
+}
+
+func uploadFromLocal(path string, filename string) error {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return cli.Exit(err, 1)
+	}
+	client := s3.NewFromConfig(cfg)
+	f, err := os.Open(path)
+	if err != nil {
+		return cli.Exit(err, 1)
+	}
+
+	input := &s3.PutObjectInput{
+		Body:   f,
+		Bucket: aws.String(ingestBucket),
+		Key:    aws.String(filename),
+	}
+	result, err := client.PutObject(context.TODO(), input)
+	fmt.Printf("Upload result: (%v)\n", result)
+	if err != nil {
+		return cli.Exit(err, 1)
+	}
+
+	fmt.Println("Succeeded")
+	return nil
+}
+
+func main() {
+	viper.SetConfigFile("config.yaml")
+	viper.SetConfigType("yaml")
+	err := viper.ReadInConfig()
+	if err != nil {
+		log.Fatal(err)
+		os.Exit(1)
+	}
+
+	apiGWUrl = fmt.Sprintf("%v", viper.Get("m2c-url"))
+	ingestBucket = fmt.Sprintf("%v", viper.Get("ingest-bucket"))
+	ipfsGW = fmt.Sprintf("%v", viper.Get("ipfs-gateway"))
+
+	uploadCommand := cli.Command{
+		Name:    "upload",
+		Aliases: []string{"u"},
+		Usage:   "upload to s3",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:        "filetype",
 				Aliases:     []string{"f"},
-				Value:       "image",
-				Usage:       "file type, possible values `image`|`text`",
+				Value:       "csv",
+				Usage:       "file type, possible values `csv`|`png`|`jpg`",
 				Destination: &filetype,
 			},
 			&cli.StringFlag{
@@ -56,12 +214,28 @@ func main() {
 				Required:    true,
 			},
 		},
-		Action: processAction,
+		Action: upload2s3,
+	}
+
+	processCommand := cli.Command{
+		Name:    "process",
+		Aliases: []string{"p"},
+		Usage:   "trigger m2c process",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "path",
+				Aliases:     []string{"u"},
+				Usage:       "file path",
+				Destination: &path,
+				Required:    true,
+			},
+		},
+		Action: triggerM2c,
 	}
 
 	app := &cli.App{
 		Name:     "ab2 command line",
-		Commands: []*cli.Command{&processCommand},
+		Commands: []*cli.Command{&uploadCommand, &processCommand},
 	}
 
 	if err := app.Run(os.Args); err != nil {
