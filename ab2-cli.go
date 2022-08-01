@@ -11,16 +11,17 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/spf13/viper"
+	"github.com/urfave/cli/v2"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"os"
+	p "path"
 	"path/filepath"
+	"strings"
 	"time"
-
-	"github.com/urfave/cli/v2"
 )
 
 var filetype string
@@ -29,6 +30,7 @@ var path string
 var apiGWUrl string
 var ingestBucket string
 var ipfsGW string
+var httpsProxy string
 
 func triggerM2c(cCtx *cli.Context) error {
 	cfg, err := config.LoadDefaultConfig(context.TODO())
@@ -103,6 +105,12 @@ func upload2s3(cCtx *cli.Context) error {
 			return err
 		}
 		return uploadFromLocal(localPath, path+"."+filetype)
+	case "http":
+		filename, localPath, err := downloadFromHttp(path)
+		if err != nil {
+			return err
+		}
+		return uploadFromLocal(localPath, filename)
 	default:
 		return fmt.Errorf("Not implemented")
 	}
@@ -110,29 +118,44 @@ func upload2s3(cCtx *cli.Context) error {
 	return nil
 }
 
+func downloadFromHttp(path string) (string, string, error) {
+	// Get the data
+	if strings.HasPrefix(httpsProxy, "http") {
+		os.Setenv("HTTPS_PROXY", httpsProxy)
+	}
+	req, _ := http.NewRequest(http.MethodGet, path, nil)
+	filename := p.Base(req.URL.Path) + "." + filetype
+	localpath, err := copyHttpBodyToTempFile(req, filename)
+	os.Unsetenv("HTTPS_PROXY")
+	return filename, localpath, err
+}
+
 func downloadFromIpfs(path string) (string, error) {
 	req, _ := http.NewRequest(http.MethodPost, ipfsGW, nil)
 	q := req.URL.Query()
 	q.Add("arg", path)
 	req.URL.RawQuery = q.Encode()
-
 	dump, _ := httputil.DumpRequestOut(req, false)
 	fmt.Println(string(dump))
+	filename := path + "." + filetype
+	return copyHttpBodyToTempFile(req, filename)
+}
 
+func copyHttpBodyToTempFile(req *http.Request, filename string) (string, error) {
 	resp, err := http.DefaultClient.Do(req)
-	fmt.Printf("Response: %v\n", resp)
+
 	if err != nil {
 		return "", err
 	}
+	fmt.Printf("Response: %v\n", resp)
+
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("error fetching from IPFS with status code %d", resp.StatusCode)
 	}
 
-	filename := path + "." + filetype
 	fmt.Printf("Filename: %s", filename)
-
 	out, err := ioutil.TempFile("", filename)
 	filename = out.Name()
 
@@ -176,7 +199,8 @@ func uploadFromLocal(path string, filename string) error {
 }
 
 func main() {
-	viper.SetConfigFile("config.yaml")
+	homedir, _ := os.UserHomeDir()
+	viper.SetConfigFile(homedir + "/go/bin/config.yaml")
 	viper.SetConfigType("yaml")
 	err := viper.ReadInConfig()
 	if err != nil {
@@ -187,6 +211,7 @@ func main() {
 	apiGWUrl = fmt.Sprintf("%v", viper.Get("m2c-url"))
 	ingestBucket = fmt.Sprintf("%v", viper.Get("ingest-bucket"))
 	ipfsGW = fmt.Sprintf("%v", viper.Get("ipfs-gateway"))
+	httpsProxy = fmt.Sprintf("%v", viper.Get("https-proxy"))
 
 	uploadCommand := cli.Command{
 		Name:    "upload",
@@ -204,7 +229,7 @@ func main() {
 				Name:        "protocol",
 				Aliases:     []string{"p"},
 				Value:       "local",
-				Usage:       "file type, possible values `local`|`ipfs`",
+				Usage:       "file type, possible values `local`|`ipfs`｜`http`",
 				Destination: &protocol,
 			},
 			&cli.StringFlag{
